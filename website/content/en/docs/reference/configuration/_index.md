@@ -551,6 +551,65 @@ sinks:
       codec: "json"
 ```
 
+#### Using seeded defaults with live overrides
+
+You can bootstrap a memory table with CSV defaults and then apply live updates at runtime
+without reloading Vector. Configure `input_mode: operations` and send operation events in the
+form below:
+
+- upsert: `{ "op": "upsert", "key": "...", "value": ... }`
+- delete: `{ "op": "delete", "key": "..." }`
+
+When `seed` is configured, deleting a key restores its seeded default if one exists.
+
+```yaml
+enrichment_tables:
+  sample_rules:
+    type: memory
+    input_mode: operations
+    seed:
+      path: /etc/vector/sample_rules.csv
+      key_field: rule_key
+      schema:
+        sample_rate: integer
+    inputs: ["sample_rule_operations"]
+
+sources:
+  sample_rule_updates:
+    type: http_client
+    endpoint: http://rule-service.internal/rules
+    scrape_interval_secs: 5
+    decoding:
+      codec: json
+    framing:
+      method: newline_delimited
+
+transforms:
+  sample_rule_operations:
+    type: remap
+    inputs: ["sample_rule_updates"]
+    source: |
+      # Example payload from source:
+      # { "operation": "upsert", "rule_key": "svc=api|env=prod|level=info", "sample_rate": 100 }
+      . = {
+        "op": .operation,
+        "key": .rule_key
+      }
+      if .op == "upsert" {
+        .value = { "sample_rate": .sample_rate }
+      }
+
+  apply_sampling:
+    type: remap
+    inputs: ["in"]
+    source: |
+      key = "svc=" + string!(.service) + "|env=" + string!(.env) + "|level=" + string!(.status)
+      row, err = get_enrichment_table_record("sample_rules", { "key": key })
+      if err == null {
+        .sample_rate = row.value.sample_rate
+      }
+```
+
 ## Sections
 
 {{< sections >}}

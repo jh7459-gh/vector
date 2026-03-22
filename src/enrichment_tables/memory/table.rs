@@ -1,6 +1,8 @@
 #![allow(unsafe_op_in_unsafe_fn)] // TODO review ShallowCopy usage code and fix properly.
 
 use std::{
+    collections::HashMap,
+    io::{Error as IoError, ErrorKind},
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
@@ -20,7 +22,7 @@ use tokio::{
 };
 use tokio_stream::wrappers::IntervalStream;
 use vector_lib::{
-    ByteSizeOf, EstimatedJsonEncodedSizeOf,
+    ByteSizeOf, EstimatedJsonEncodedSizeOf, TimeZone,
     config::LogNamespace,
     enrichment::{Case, Condition, Error, IndexHandle, InternalError, Table},
     event::{Event, EventStatus, Finalizable},
@@ -35,12 +37,14 @@ use vrl::value::{KeyString, ObjectMap, Value};
 use super::source::MemorySource;
 use crate::{
     SourceSender,
+    enrichment_tables::file::{FileConfig, FileSettings},
     enrichment_tables::memory::{
-        MemoryConfig,
+        MemoryConfig, MemoryInputMode,
         internal_events::{
             MemoryEnrichmentTableFlushed, MemoryEnrichmentTableInsertFailed,
-            MemoryEnrichmentTableInserted, MemoryEnrichmentTableRead,
-            MemoryEnrichmentTableReadFailed, MemoryEnrichmentTableTtlExpired,
+            MemoryEnrichmentTableInserted, MemoryEnrichmentTableOperationFailed,
+            MemoryEnrichmentTableRead, MemoryEnrichmentTableReadFailed,
+            MemoryEnrichmentTableTtlExpired,
         },
     },
 };
@@ -51,6 +55,7 @@ pub struct MemoryEntry {
     value: String,
     update_time: CopyValue<Instant>,
     ttl: u64,
+    expires: bool,
 }
 
 impl ByteSizeOf for MemoryEntry {
@@ -60,10 +65,28 @@ impl ByteSizeOf for MemoryEntry {
 }
 
 impl MemoryEntry {
+    fn from_value(value: Value, now: Instant, ttl: u64, expires: bool) -> Result<Self, Error> {
+        // Unreachable in normal operation: `Value` should always be serializable to JSON here.
+        let value = serde_json::to_string(&value).map_err(|source| Error::Internal {
+            source: InternalError::FailedToDecode {
+                details: source.to_string(),
+            },
+        })?;
+        Ok(Self {
+            value,
+            update_time: now.into(),
+            ttl,
+            expires,
+        })
+    }
+
     pub(super) fn as_object_map(&self, now: Instant, key: &str) -> Result<ObjectMap, Error> {
-        let ttl = self
-            .ttl
-            .saturating_sub(now.duration_since(*self.update_time).as_secs());
+        let ttl = if self.expires {
+            self.ttl
+                .saturating_sub(now.duration_since(*self.update_time).as_secs())
+        } else {
+            u64::MAX
+        };
         Ok(ObjectMap::from([
             (
                 KeyString::from("key"),
@@ -86,7 +109,7 @@ impl MemoryEntry {
     }
 
     fn expired(&self, now: Instant) -> bool {
-        now.duration_since(*self.update_time).as_secs() > self.ttl
+        self.expires && now.duration_since(*self.update_time).as_secs() > self.ttl
     }
 }
 
@@ -115,6 +138,7 @@ pub struct Memory {
     read_handle_factory: evmap::ReadHandleFactory<String, MemoryEntry>,
     read_handle: ThreadLocal<evmap::ReadHandle<String, MemoryEntry>>,
     pub(super) write_handle: Arc<Mutex<MemoryWriter>>,
+    seed_entries: Arc<HashMap<String, MemoryEntry>>,
     pub(super) config: MemoryConfig,
     #[allow(dead_code)]
     expired_items_receiver: Receiver<Vec<MemoryEntryPair>>,
@@ -123,23 +147,48 @@ pub struct Memory {
 
 impl Memory {
     /// Creates a new [Memory] based on the provided config.
-    pub fn new(config: MemoryConfig) -> Self {
+    pub fn new(config: MemoryConfig, timezone: TimeZone) -> crate::Result<Self> {
         let (read_handle, write_handle) = evmap::new();
+        let seed_entries = Self::load_seed_entries(&config, timezone)?;
+        let mut writer = MemoryWriter {
+            write_handle,
+            metadata: MemoryMetadata::default(),
+        };
+
+        for (key, entry) in &seed_entries {
+            writer.metadata.byte_size = writer
+                .metadata
+                .byte_size
+                .saturating_add((key.size_of() + entry.size_of()) as u64);
+            writer.write_handle.update(key.clone(), entry.clone());
+        }
+
+        if let Some(max_byte_size) = config.max_byte_size
+            && writer.metadata.byte_size > max_byte_size
+        {
+            return Err(Box::new(IoError::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "Seed data exceeds max_byte_size ({} > {})",
+                    writer.metadata.byte_size, max_byte_size
+                ),
+            )));
+        }
+        writer.write_handle.refresh();
+
         // Buffer could only be used if source is stuck exporting available items, but in that case,
         // publishing will not happen either, because the lock would be held, so this buffer is not
         // that important
         let (expired_tx, expired_rx) = tokio::sync::broadcast::channel(5);
-        Self {
+        Ok(Self {
             config,
             read_handle_factory: read_handle.factory(),
             read_handle: ThreadLocal::new(),
-            write_handle: Arc::new(Mutex::new(MemoryWriter {
-                write_handle,
-                metadata: MemoryMetadata::default(),
-            })),
+            write_handle: Arc::new(Mutex::new(writer)),
+            seed_entries: Arc::new(seed_entries),
             expired_items_sender: expired_tx,
             expired_items_receiver: expired_rx,
-        }
+        })
     }
 
     pub(super) fn get_read_handle(&self) -> &evmap::ReadHandle<String, MemoryEntry> {
@@ -151,56 +200,206 @@ impl Memory {
         self.expired_items_sender.subscribe()
     }
 
+    fn load_seed_entries(
+        config: &MemoryConfig,
+        timezone: TimeZone,
+    ) -> crate::Result<HashMap<String, MemoryEntry>> {
+        let Some(seed) = config.seed.as_ref() else {
+            return Ok(HashMap::new());
+        };
+
+        let file_config = FileConfig {
+            file: FileSettings {
+                path: seed.path.clone(),
+                encoding: seed.encoding.clone(),
+            },
+            schema: seed.schema.clone(),
+        };
+        let file_data = file_config.load_file(timezone)?;
+        let key_field = seed.key_field.as_str();
+        let Some(_key_index) = file_data.headers.iter().position(|h| h == key_field) else {
+            return Err(Box::new(IoError::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "Seed key_field '{}' was not found in CSV headers.",
+                    seed.key_field
+                ),
+            )));
+        };
+
+        let now = Instant::now();
+        let mut seeded = HashMap::new();
+        let headers = file_data.headers;
+        for row in file_data.data.into_iter() {
+            let mut key = None;
+            let mut value = ObjectMap::new();
+
+            for (header, column) in headers.iter().zip(row.into_iter()) {
+                if header == key_field {
+                    key = Some(column.to_string_lossy().into_owned());
+                } else {
+                    value.insert(header.clone().into(), column);
+                }
+            }
+
+            let Some(key) = key else {
+                continue;
+            };
+
+            let entry = MemoryEntry::from_value(
+                Value::Object(value),
+                now,
+                config.ttl,
+                false, // seeded defaults never expire
+            )?;
+            seeded.insert(key, entry);
+        }
+
+        Ok(seeded)
+    }
+
+    fn upsert_entry(
+        &self,
+        writer: &mut MutexGuard<'_, MemoryWriter>,
+        key: String,
+        entry: MemoryEntry,
+        emit_metrics: bool,
+    ) -> bool {
+        let old_size = writer
+            .write_handle
+            .get_one(&key)
+            .map(|old| (key.size_of() + old.size_of()) as u64)
+            .unwrap_or_default();
+        let new_size = (key.size_of() + entry.size_of()) as u64;
+        let projected_size = writer
+            .metadata
+            .byte_size
+            .saturating_sub(old_size)
+            .saturating_add(new_size);
+        if let Some(max_byte_size) = self.config.max_byte_size
+            && projected_size > max_byte_size
+        {
+            emit!(MemoryEnrichmentTableInsertFailed {
+                key: &key,
+                include_key_metric_tag: self.config.internal_metrics.include_key_tag
+            });
+            return false;
+        }
+
+        writer.metadata.byte_size = projected_size;
+        if emit_metrics {
+            emit!(MemoryEnrichmentTableInserted {
+                key: &key,
+                include_key_metric_tag: self.config.internal_metrics.include_key_tag
+            });
+        }
+        writer.write_handle.update(key, entry);
+        true
+    }
+
+    fn restore_seed_or_delete(&self, writer: &mut MutexGuard<'_, MemoryWriter>, key: String) {
+        if let Some(seed) = self.seed_entries.get(&key) {
+            writer.write_handle.update(key, seed.clone());
+        } else {
+            writer.write_handle.empty(key);
+        }
+    }
+
+    fn handle_legacy_map(
+        &self,
+        value: ObjectMap,
+        writer: &mut MutexGuard<'_, MemoryWriter>,
+        now: Instant,
+    ) {
+        for (k, value) in value.into_iter() {
+            let key = String::from(k);
+            let ttl = self
+                .config
+                .ttl_field
+                .path
+                .as_ref()
+                .and_then(|p| value.get(p))
+                .and_then(|v| v.as_integer())
+                .map(|v| v as u64)
+                .unwrap_or(self.config.ttl);
+
+            let Ok(entry) = MemoryEntry::from_value(value, now, ttl, true) else {
+                emit!(MemoryEnrichmentTableInsertFailed {
+                    key: &key,
+                    include_key_metric_tag: self.config.internal_metrics.include_key_tag
+                });
+                continue;
+            };
+            _ = self.upsert_entry(writer, key, entry, true);
+        }
+    }
+
+    fn handle_operations(
+        &self,
+        value: ObjectMap,
+        writer: &mut MutexGuard<'_, MemoryWriter>,
+        now: Instant,
+    ) {
+        let Some(op) = value.get("op").and_then(|v| match v {
+            Value::Bytes(bytes) => std::str::from_utf8(bytes)
+                .ok()
+                .map(|s| s.to_ascii_lowercase()),
+            _ => None,
+        }) else {
+            emit!(MemoryEnrichmentTableOperationFailed {
+                reason: "missing_or_invalid_op"
+            });
+            return;
+        };
+
+        match op.as_str() {
+            "upsert" => {
+                let Some(key) = value.get("key").map(|v| v.to_string_lossy().into_owned()) else {
+                    emit!(MemoryEnrichmentTableOperationFailed {
+                        reason: "missing_key_for_upsert"
+                    });
+                    return;
+                };
+                let Some(upsert_value) = value.get("value").cloned() else {
+                    emit!(MemoryEnrichmentTableOperationFailed {
+                        reason: "missing_value_for_upsert"
+                    });
+                    return;
+                };
+                let Ok(entry) = MemoryEntry::from_value(upsert_value, now, self.config.ttl, true)
+                else {
+                    emit!(MemoryEnrichmentTableInsertFailed {
+                        key: &key,
+                        include_key_metric_tag: self.config.internal_metrics.include_key_tag
+                    });
+                    return;
+                };
+                _ = self.upsert_entry(writer, key, entry, true);
+            }
+            "delete" => {
+                let Some(key) = value.get("key").map(|v| v.to_string_lossy().into_owned()) else {
+                    emit!(MemoryEnrichmentTableOperationFailed {
+                        reason: "missing_key_for_delete"
+                    });
+                    return;
+                };
+                self.restore_seed_or_delete(writer, key);
+            }
+            _ => {
+                emit!(MemoryEnrichmentTableOperationFailed {
+                    reason: "unsupported_operation"
+                });
+            }
+        }
+    }
+
     fn handle_value(&self, value: ObjectMap) {
         let mut writer = self.write_handle.lock().expect("mutex poisoned");
         let now = Instant::now();
 
-        for (k, value) in value.into_iter() {
-            let new_entry_key = String::from(k);
-            let Ok(v) = serde_json::to_string(&value) else {
-                emit!(MemoryEnrichmentTableInsertFailed {
-                    key: &new_entry_key,
-                    include_key_metric_tag: self.config.internal_metrics.include_key_tag
-                });
-                continue;
-            };
-            let new_entry = MemoryEntry {
-                value: v,
-                update_time: now.into(),
-                ttl: self
-                    .config
-                    .ttl_field
-                    .path
-                    .as_ref()
-                    .and_then(|p| value.get(p))
-                    .and_then(|v| v.as_integer())
-                    .map(|v| v as u64)
-                    .unwrap_or(self.config.ttl),
-            };
-            let new_entry_size = new_entry_key.size_of() + new_entry.size_of();
-            if let Some(max_byte_size) = self.config.max_byte_size
-                && writer
-                    .metadata
-                    .byte_size
-                    .saturating_add(new_entry_size as u64)
-                    > max_byte_size
-            {
-                // Reject new entries
-                emit!(MemoryEnrichmentTableInsertFailed {
-                    key: &new_entry_key,
-                    include_key_metric_tag: self.config.internal_metrics.include_key_tag
-                });
-                continue;
-            }
-            writer.metadata.byte_size = writer
-                .metadata
-                .byte_size
-                .saturating_add(new_entry_size as u64);
-            emit!(MemoryEnrichmentTableInserted {
-                key: &new_entry_key,
-                include_key_metric_tag: self.config.internal_metrics.include_key_tag
-            });
-            writer.write_handle.update(new_entry_key, new_entry);
+        match self.config.input_mode {
+            MemoryInputMode::LegacyMap => self.handle_legacy_map(value, &mut writer, now),
+            MemoryInputMode::Operations => self.handle_operations(value, &mut writer, now),
         }
 
         if self.config.flush_interval.is_none() {
@@ -222,7 +421,11 @@ impl Memory {
                 {
                     // Byte size is not reduced at this point, because the actual deletion
                     // will only happen at refresh time
-                    writer.write_handle.empty(k.clone());
+                    if let Some(seed) = self.seed_entries.get(k.as_str()) {
+                        writer.write_handle.update(k.clone(), seed.clone());
+                    } else {
+                        writer.write_handle.empty(k.clone());
+                    }
                     emit!(MemoryEnrichmentTableTtlExpired {
                         key: k,
                         include_key_metric_tag: self.config.internal_metrics.include_key_tag
@@ -310,6 +513,7 @@ impl Clone for Memory {
             read_handle_factory: self.read_handle_factory.clone(),
             read_handle: ThreadLocal::new(),
             write_handle: Arc::clone(&self.write_handle),
+            seed_entries: Arc::clone(&self.seed_entries),
             config: self.config.clone(),
             expired_items_sender: self.expired_items_sender.clone(),
             expired_items_receiver: self.expired_items_sender.subscribe(),
@@ -450,7 +654,7 @@ impl StreamSink<Event> for Memory {
 
 #[cfg(test)]
 mod tests {
-    use std::{num::NonZeroU64, slice::from_ref, time::Duration};
+    use std::{collections::HashMap, fs, num::NonZeroU64, slice::from_ref, time::Duration};
 
     use futures::{StreamExt, future::ready};
     use futures_util::stream;
@@ -466,7 +670,8 @@ mod tests {
     use super::*;
     use crate::{
         enrichment_tables::memory::{
-            config::MemorySourceConfig, internal_events::InternalMetricsConfig,
+            MemoryInputMode, MemorySeedConfig, config::MemorySourceConfig,
+            internal_events::InternalMetricsConfig,
         },
         event::{Event, LogEvent},
         test_util::components::{
@@ -475,15 +680,34 @@ mod tests {
         },
     };
 
-    fn build_memory_config(modfn: impl Fn(&mut MemoryConfig)) -> MemoryConfig {
+    fn build_memory_config(modfn: impl FnOnce(&mut MemoryConfig)) -> MemoryConfig {
         let mut config = MemoryConfig::default();
         modfn(&mut config);
         config
     }
 
+    fn make_seed_config() -> (MemorySeedConfig, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seed.csv");
+        fs::write(&path, "key,rate\nfoo,10\n").unwrap();
+
+        let mut schema = HashMap::new();
+        schema.insert("rate".to_string(), "integer".to_string());
+
+        (
+            MemorySeedConfig {
+                path,
+                encoding: Default::default(),
+                schema,
+                key_field: "key".to_string(),
+            },
+            dir,
+        )
+    }
+
     #[test]
     fn finds_row() {
-        let memory = Memory::new(Default::default());
+        let memory = Memory::new(Default::default(), TimeZone::default()).unwrap();
         memory.handle_value(ObjectMap::from([("test_key".into(), Value::from(5))]));
 
         let condition = Condition::Equals {
@@ -505,7 +729,8 @@ mod tests {
     fn calculates_ttl() {
         let ttl = 100;
         let secs_to_subtract = 10;
-        let memory = Memory::new(build_memory_config(|c| c.ttl = ttl));
+        let memory =
+            Memory::new(build_memory_config(|c| c.ttl = ttl), TimeZone::default()).unwrap();
         {
             let mut handle = memory.write_handle.lock().unwrap();
             handle.write_handle.update(
@@ -514,6 +739,7 @@ mod tests {
                     value: "5".to_string(),
                     update_time: (Instant::now() - Duration::from_secs(secs_to_subtract)).into(),
                     ttl,
+                    expires: true,
                 },
             );
             handle.write_handle.refresh();
@@ -538,10 +764,14 @@ mod tests {
     fn calculates_ttl_override() {
         let global_ttl = 100;
         let ttl_override = 10;
-        let memory = Memory::new(build_memory_config(|c| {
-            c.ttl = global_ttl;
-            c.ttl_field = OptionalValuePath::new("ttl");
-        }));
+        let memory = Memory::new(
+            build_memory_config(|c| {
+                c.ttl = global_ttl;
+                c.ttl_field = OptionalValuePath::new("ttl");
+            }),
+            TimeZone::default(),
+        )
+        .unwrap();
         memory.handle_value(ObjectMap::from([
             (
                 "ttl_override".into(),
@@ -595,9 +825,8 @@ mod tests {
     #[test]
     fn removes_expired_records_on_scan_interval() {
         let ttl = 100;
-        let memory = Memory::new(build_memory_config(|c| {
-            c.ttl = ttl;
-        }));
+        let memory =
+            Memory::new(build_memory_config(|c| c.ttl = ttl), TimeZone::default()).unwrap();
         {
             let mut handle = memory.write_handle.lock().unwrap();
             handle.write_handle.update(
@@ -606,6 +835,7 @@ mod tests {
                     value: "5".to_string(),
                     update_time: (Instant::now() - Duration::from_secs(ttl + 10)).into(),
                     ttl,
+                    expires: true,
                 },
             );
             handle.write_handle.refresh();
@@ -642,10 +872,14 @@ mod tests {
     #[test]
     fn does_not_show_values_before_flush_interval() {
         let ttl = 100;
-        let memory = Memory::new(build_memory_config(|c| {
-            c.ttl = ttl;
-            c.flush_interval = Some(10);
-        }));
+        let memory = Memory::new(
+            build_memory_config(|c| {
+                c.ttl = ttl;
+                c.flush_interval = Some(10);
+            }),
+            TimeZone::default(),
+        )
+        .unwrap();
         memory.handle_value(ObjectMap::from([("test_key".into(), Value::from(5))]));
 
         let condition = Condition::Equals {
@@ -665,7 +899,8 @@ mod tests {
     #[test]
     fn updates_ttl_on_value_replacement() {
         let ttl = 100;
-        let memory = Memory::new(build_memory_config(|c| c.ttl = ttl));
+        let memory =
+            Memory::new(build_memory_config(|c| c.ttl = ttl), TimeZone::default()).unwrap();
         {
             let mut handle = memory.write_handle.lock().unwrap();
             handle.write_handle.update(
@@ -674,6 +909,7 @@ mod tests {
                     value: "5".to_string(),
                     update_time: (Instant::now() - Duration::from_secs(ttl / 2)).into(),
                     ttl,
+                    expires: true,
                 },
             );
             handle.write_handle.refresh();
@@ -706,9 +942,13 @@ mod tests {
 
     #[test]
     fn ignores_all_values_over_byte_size_limit() {
-        let memory = Memory::new(build_memory_config(|c| {
-            c.max_byte_size = Some(1);
-        }));
+        let memory = Memory::new(
+            build_memory_config(|c| {
+                c.max_byte_size = Some(1);
+            }),
+            TimeZone::default(),
+        )
+        .unwrap();
         memory.handle_value(ObjectMap::from([("test_key".into(), Value::from(5))]));
 
         let condition = Condition::Equals {
@@ -728,10 +968,14 @@ mod tests {
     #[test]
     fn ignores_values_when_byte_size_limit_is_reached() {
         let ttl = 100;
-        let memory = Memory::new(build_memory_config(|c| {
-            c.ttl = ttl;
-            c.max_byte_size = Some(150);
-        }));
+        let memory = Memory::new(
+            build_memory_config(|c| {
+                c.ttl = ttl;
+                c.max_byte_size = Some(150);
+            }),
+            TimeZone::default(),
+        )
+        .unwrap();
         memory.handle_value(ObjectMap::from([("test_key".into(), Value::from(5))]));
         memory.handle_value(ObjectMap::from([("rejected_key".into(), Value::from(5))]));
 
@@ -773,7 +1017,7 @@ mod tests {
 
     #[test]
     fn missing_key() {
-        let memory = Memory::new(Default::default());
+        let memory = Memory::new(Default::default(), TimeZone::default()).unwrap();
 
         let condition = Condition::Equals {
             field: "key",
@@ -789,6 +1033,178 @@ mod tests {
         );
     }
 
+    #[test]
+    fn loads_seeded_defaults() {
+        let (seed, _seed_dir) = make_seed_config();
+        let memory = Memory::new(
+            build_memory_config(|c| c.seed = Some(seed)),
+            TimeZone::default(),
+        )
+        .unwrap();
+
+        let condition = Condition::Equals {
+            field: "key",
+            value: Value::from("foo"),
+        };
+
+        let row = memory
+            .find_table_row(Case::Sensitive, &[condition], None, None, None)
+            .unwrap();
+
+        assert_eq!(row["key"], Value::from("foo"));
+        assert_eq!(
+            row["value"],
+            Value::from(ObjectMap::from([("rate".into(), Value::from(10))]))
+        );
+    }
+
+    #[test]
+    fn rejects_seed_with_missing_key_field() {
+        let (mut seed, _seed_dir) = make_seed_config();
+        seed.key_field = "missing".to_string();
+        let result = Memory::new(
+            build_memory_config(|c| c.seed = Some(seed)),
+            TimeZone::default(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn operations_upsert_overrides_seed() {
+        let (seed, _seed_dir) = make_seed_config();
+        let memory = Memory::new(
+            build_memory_config(|c| {
+                c.seed = Some(seed);
+                c.input_mode = MemoryInputMode::Operations;
+            }),
+            TimeZone::default(),
+        )
+        .unwrap();
+
+        memory.handle_value(ObjectMap::from([
+            ("op".into(), Value::from("upsert")),
+            ("key".into(), Value::from("foo")),
+            (
+                "value".into(),
+                Value::from(ObjectMap::from([("rate".into(), Value::from(99))])),
+            ),
+        ]));
+
+        let condition = Condition::Equals {
+            field: "key",
+            value: Value::from("foo"),
+        };
+        let row = memory
+            .find_table_row(Case::Sensitive, &[condition], None, None, None)
+            .unwrap();
+        assert_eq!(
+            row["value"],
+            Value::from(ObjectMap::from([("rate".into(), Value::from(99))]))
+        );
+    }
+
+    #[test]
+    fn operations_delete_restores_seeded_value() {
+        let (seed, _seed_dir) = make_seed_config();
+        let memory = Memory::new(
+            build_memory_config(|c| {
+                c.seed = Some(seed);
+                c.input_mode = MemoryInputMode::Operations;
+            }),
+            TimeZone::default(),
+        )
+        .unwrap();
+
+        memory.handle_value(ObjectMap::from([
+            ("op".into(), Value::from("upsert")),
+            ("key".into(), Value::from("foo")),
+            (
+                "value".into(),
+                Value::from(ObjectMap::from([("rate".into(), Value::from(42))])),
+            ),
+        ]));
+        memory.handle_value(ObjectMap::from([
+            ("op".into(), Value::from("delete")),
+            ("key".into(), Value::from("foo")),
+        ]));
+
+        let condition = Condition::Equals {
+            field: "key",
+            value: Value::from("foo"),
+        };
+        let row = memory
+            .find_table_row(Case::Sensitive, &[condition], None, None, None)
+            .unwrap();
+        assert_eq!(
+            row["value"],
+            Value::from(ObjectMap::from([("rate".into(), Value::from(10))]))
+        );
+    }
+
+    #[test]
+    fn operations_delete_removes_non_seeded_value() {
+        let memory = Memory::new(
+            build_memory_config(|c| c.input_mode = MemoryInputMode::Operations),
+            TimeZone::default(),
+        )
+        .unwrap();
+
+        memory.handle_value(ObjectMap::from([
+            ("op".into(), Value::from("upsert")),
+            ("key".into(), Value::from("bar")),
+            (
+                "value".into(),
+                Value::from(ObjectMap::from([("rate".into(), Value::from(42))])),
+            ),
+        ]));
+        memory.handle_value(ObjectMap::from([
+            ("op".into(), Value::from("delete")),
+            ("key".into(), Value::from("bar")),
+        ]));
+
+        let rows = memory
+            .find_table_rows(
+                Case::Sensitive,
+                &[Condition::Equals {
+                    field: "key",
+                    value: Value::from("bar"),
+                }],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn operations_with_invalid_payload_are_ignored() {
+        let memory = Memory::new(
+            build_memory_config(|c| c.input_mode = MemoryInputMode::Operations),
+            TimeZone::default(),
+        )
+        .unwrap();
+
+        memory.handle_value(ObjectMap::from([
+            ("op".into(), Value::from("upsert")),
+            ("key".into(), Value::from("bar")),
+        ]));
+
+        let rows = memory
+            .find_table_rows(
+                Case::Sensitive,
+                &[Condition::Equals {
+                    field: "key",
+                    value: Value::from("bar"),
+                }],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
     #[tokio::test]
     async fn sink_spec_compliance() {
         let event = Event::Log(LogEvent::from(ObjectMap::from([(
@@ -796,7 +1212,7 @@ mod tests {
             Value::from(5),
         )])));
 
-        let memory = Memory::new(Default::default());
+        let memory = Memory::new(Default::default(), TimeZone::default()).unwrap();
 
         run_and_assert_sink_compliance(
             VectorSink::from_event_streamsink(memory),
@@ -813,7 +1229,7 @@ mod tests {
             Value::from(5),
         )])));
 
-        let memory = Memory::new(Default::default());
+        let memory = Memory::new(Default::default(), TimeZone::default()).unwrap();
 
         run_and_assert_sink_compliance(
             VectorSink::from_event_streamsink(memory),
@@ -882,9 +1298,13 @@ mod tests {
             Value::from(5),
         )])));
 
-        let memory = Memory::new(build_memory_config(|c| {
-            c.flush_interval = Some(1);
-        }));
+        let memory = Memory::new(
+            build_memory_config(|c| {
+                c.flush_interval = Some(1);
+            }),
+            TimeZone::default(),
+        )
+        .unwrap();
 
         run_and_assert_sink_compliance(
             VectorSink::from_event_streamsink(memory),
@@ -960,11 +1380,15 @@ mod tests {
             Value::from(5),
         )])));
 
-        let memory = Memory::new(build_memory_config(|c| {
-            c.internal_metrics = InternalMetricsConfig {
-                include_key_tag: true,
-            };
-        }));
+        let memory = Memory::new(
+            build_memory_config(|c| {
+                c.internal_metrics = InternalMetricsConfig {
+                    include_key_tag: true,
+                };
+            }),
+            TimeZone::default(),
+        )
+        .unwrap();
 
         run_and_assert_sink_compliance(
             VectorSink::from_event_streamsink(memory),
@@ -992,7 +1416,7 @@ mod tests {
             Value::from(5),
         )])));
 
-        let memory = Memory::new(Default::default());
+        let memory = Memory::new(Default::default(), TimeZone::default()).unwrap();
 
         run_and_assert_sink_compliance(
             VectorSink::from_event_streamsink(memory),
@@ -1023,7 +1447,10 @@ mod tests {
             export_expired_items: false,
             source_key: "test".to_string(),
         });
-        let memory = memory_config.get_or_build_memory().await;
+        let memory = memory_config
+            .get_or_build_memory(Some(TimeZone::default()))
+            .await
+            .unwrap();
         memory.handle_value(ObjectMap::from([("test_key".into(), Value::from(5))]));
 
         let mut events: Vec<Event> = run_and_assert_source_compliance(

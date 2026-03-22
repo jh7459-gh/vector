@@ -1,0 +1,1 @@
+Added seeded default data and operation-based runtime writes to the `memory` enrichment table via the new `seed` and `input_mode` options, enabling live upsert/delete overrides without Vector reloads.

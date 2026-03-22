@@ -1,9 +1,10 @@
-use std::{num::NonZeroU64, sync::Arc};
+use std::{collections::HashMap, num::NonZeroU64, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use futures::{FutureExt, future};
 use tokio::sync::Mutex;
 use vector_lib::{
+    TimeZone,
     config::{AcknowledgementsConfig, DataType, Input, LogNamespace},
     configurable::configurable_component,
     enrichment::Table,
@@ -19,6 +20,7 @@ use crate::{
     config::{
         EnrichmentTableConfig, SinkConfig, SinkContext, SourceConfig, SourceContext, SourceOutput,
     },
+    enrichment_tables::file::Encoding,
     sinks::Healthcheck,
     sources::Source,
 };
@@ -69,8 +71,53 @@ pub struct MemoryConfig {
     #[serde(default)]
     pub ttl_field: OptionalValuePath,
 
+    /// Controls how incoming events are interpreted when writing into the memory table.
+    #[serde(default)]
+    pub input_mode: MemoryInputMode,
+
+    /// Optional bootstrap data loaded from a CSV file at startup.
+    #[serde(skip_serializing_if = "vector_lib::serde::is_default")]
+    pub seed: Option<MemorySeedConfig>,
+
     #[serde(skip)]
     memory: Arc<Mutex<Option<Box<Memory>>>>,
+}
+
+/// Memory enrichment table write protocol.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryInputMode {
+    /// Existing behavior: each key-value pair in the event object is written as an entry.
+    #[default]
+    LegacyMap,
+
+    /// Operation-based behavior with explicit upsert/delete commands.
+    Operations,
+}
+
+/// Bootstrap data settings for memory enrichment tables.
+#[configurable_component]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemorySeedConfig {
+    /// Path to the seed CSV file.
+    pub path: PathBuf,
+
+    /// CSV file encoding configuration.
+    #[configurable(derived)]
+    #[serde(default)]
+    pub encoding: Encoding,
+
+    /// Optional key/value pairs representing mapped column names and types.
+    #[serde(default)]
+    #[configurable(metadata(
+        docs::additional_props_description = "Represents mapped column names and types."
+    ))]
+    pub schema: HashMap<String, String>,
+
+    /// Column used as the memory table key.
+    #[serde(default = "default_seed_key_field")]
+    pub key_field: String,
 }
 
 /// Configuration for memory enrichment table source functionality.
@@ -107,6 +154,8 @@ impl PartialEq for MemoryConfig {
         self.ttl == other.ttl
             && self.scan_interval == other.scan_interval
             && self.flush_interval == other.flush_interval
+            && self.input_mode == other.input_mode
+            && self.seed == other.seed
     }
 }
 impl Eq for MemoryConfig {}
@@ -123,6 +172,8 @@ impl Default for MemoryConfig {
             source_config: None,
             internal_metrics: InternalMetricsConfig::default(),
             ttl_field: OptionalValuePath::none(),
+            input_mode: MemoryInputMode::default(),
+            seed: None,
         }
     }
 }
@@ -135,21 +186,35 @@ const fn default_scan_interval() -> NonZeroU64 {
     unsafe { NonZeroU64::new_unchecked(30) }
 }
 
+fn default_seed_key_field() -> String {
+    "key".to_string()
+}
+
 impl MemoryConfig {
-    pub(super) async fn get_or_build_memory(&self) -> Memory {
+    pub(super) async fn get_or_build_memory(
+        &self,
+        timezone: Option<TimeZone>,
+    ) -> crate::Result<Memory> {
         let mut boxed_memory = self.memory.lock().await;
-        *boxed_memory
-            .get_or_insert_with(|| Box::new(Memory::new(self.clone())))
-            .clone()
+        if let Some(memory) = boxed_memory.as_ref() {
+            return Ok(memory.as_ref().clone());
+        }
+
+        let timezone = timezone.unwrap_or_default();
+        let memory = Memory::new(self.clone(), timezone)?;
+        *boxed_memory = Some(Box::new(memory.clone()));
+        Ok(memory)
     }
 }
 
 impl EnrichmentTableConfig for MemoryConfig {
     async fn build(
         &self,
-        _globals: &crate::config::GlobalOptions,
+        globals: &crate::config::GlobalOptions,
     ) -> crate::Result<Box<dyn Table + Send + Sync>> {
-        Ok(Box::new(self.get_or_build_memory().await))
+        Ok(Box::new(
+            self.get_or_build_memory(Some(globals.timezone())).await?,
+        ))
     }
 
     fn sink_config(
@@ -177,7 +242,7 @@ impl EnrichmentTableConfig for MemoryConfig {
 #[typetag::serde(name = "memory_enrichment_table")]
 impl SinkConfig for MemoryConfig {
     async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let sink = VectorSink::from_event_streamsink(self.get_or_build_memory().await);
+        let sink = VectorSink::from_event_streamsink(self.get_or_build_memory(None).await?);
 
         Ok((sink, future::ok(()).boxed()))
     }
@@ -195,7 +260,7 @@ impl SinkConfig for MemoryConfig {
 #[typetag::serde(name = "memory_enrichment_table")]
 impl SourceConfig for MemoryConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<Source> {
-        let memory = self.get_or_build_memory().await;
+        let memory = self.get_or_build_memory(None).await?;
 
         let log_namespace = cx.log_namespace(self.log_namespace);
 

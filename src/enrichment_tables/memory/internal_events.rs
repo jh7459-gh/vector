@@ -129,3 +129,18 @@ impl InternalEvent for MemoryEnrichmentTableInsertFailed<'_> {
         }
     }
 }
+
+#[derive(Debug, NamedInternalEvent)]
+pub(crate) struct MemoryEnrichmentTableOperationFailed<'a> {
+    pub reason: &'a str,
+}
+
+impl InternalEvent for MemoryEnrichmentTableOperationFailed<'_> {
+    fn emit(self) {
+        counter!(
+            "memory_enrichment_table_failed_operations_total",
+            "reason" => self.reason.to_owned()
+        )
+        .increment(1);
+    }
+}

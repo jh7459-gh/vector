@@ -84,6 +84,7 @@ export VERSION ?= $(shell command -v cargo >/dev/null && $(VDEV) version || echo
 export CI ?= false
 
 export RUST_VERSION ?= $(shell grep channel rust-toolchain.toml | cut -d '"' -f 2)
+export MEMORY_SEED_OPS_ARGS ?=
 
 FORMATTING_BEGIN_YELLOW = \033[0;33m
 FORMATTING_BEGIN_BLUE = \033[36m
@@ -409,6 +410,10 @@ endif
 .PHONY: test-e2e-kubernetes
 test-e2e-kubernetes: ## Runs Kubernetes E2E tests (Sorry, no `ENVIRONMENT=true` support)
 	RUST_VERSION=${RUST_VERSION} scripts/test-e2e-kubernetes.sh
+
+.PHONY: test-e2e-memory-seed-operations
+test-e2e-memory-seed-operations: ## Runs local seeded-memory live-override E2E harness (no `ENVIRONMENT=true` support)
+	scripts/test-e2e-memory-seed-operations.sh ${MEMORY_SEED_OPS_ARGS}
 
 .PHONY: test-cli
 test-cli: ## Runs cli tests

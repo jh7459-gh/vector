@@ -14,6 +14,10 @@ The script verifies:
 1. A live upsert overrides seeded data.
 2. A delete restores seeded fallback for seeded keys.
 3. A non-seeded upsert remains present.
+
+Note:
+  --skip-build assumes target/debug/vector already exists with required features.
+  If unsure, run without --skip-build.
 EOF
 }
 
